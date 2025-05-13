@@ -1,0 +1,334 @@
+USE [OSJSupervision]
+GO
+
+/****** Object:  StoredProcedure [dbo].[OSJ_CreateTasks]    Script Date: 3/22/2024 4:46:46 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE  PROCEDURE [dbo].[OSJ_CreateTasks]             
+/********************************************************************************************        
+Stored Procedure: $HeaderUTC$        
+=============================================================================================        
+Name:  OSJ_CreateTasks        
+---------------------------------------------------------------------------------------------        
+Author:  William Lee        
+---------------------------------------------------------------------------------------------        
+Version:  1.0        
+---------------------------------------------------------------------------------------------        
+Project:  OSJ Manager Surveillance System        
+---------------------------------------------------------------------------------------------        
+Purpose: Create Review Items for periodic OSJ tasks per peremeter passed in.        
+---------------------------------------------------------------------------------------------        
+Syntax:  EXEC OSJ_CreateTasks 1 ,1 -- Create daily tasks          
+  EXEC OSJ_CreateTasks 3 ,1 -- Create monthly tasks        
+=============================================================================================        
+Comments:         
+---------------------------------------------------------------------------------------------        
+$LogUTC[5]$        
+  1.0 2007-01-04 William Lee Initial version         
+  1.1 2014-09-02 Schanduru Added DIS Error/Log processing logic      
+  1.2 2014-09-05 Khushboo Dubey  Added a Parameter @TenantID for implementing MultiTenancy Feature.      
+                                  This will add the data in table specific to LPL and AXA            
+   1.2 2015-05-28 Balamurugan Sethu  Added a new procedure to craete tasks for MF switches from Matas Trade details   
+   1.4 2017-04-04 DOL 609 Vipul Shinkar Added new SP to create MFO Review Item      
+   1.3 2017-05-11 -Vipul Shinkar - WO SD737438 Removed the SP Call Incomplete_master from OSJ_CreateTasks. Call moved to SP OSJ_ProcessControl(at the end after OSJ_HoldUholdNewAccounts).                                      
+=============================================================================================        
+(C) Copyright 2007 LPL, Inc.. All Rights Reserved.        
+THIS SOURCE CODE IS THE PROPERTY OF LPL, Inc.. IT MAY BE USED BY RECIPIENT ONLY FOR THE         
+PURPOSE FOR WHICH IT WAS TRANSMITTED AND WILL BE RETURNED UPON REQUEST OR WHEN NO LONGER         
+NEEDED BY RECIPIENT. IT MAY NOT BE COPIED OR COMMUNICATED WITHOUT THE WRITTEN CONSENT         
+OF LPL, Inc.         
+********************************************************************************************/        
+ @FrequencyIntervalID int ,      
+ @TenantID Int  --Added a Parameter @TenantID for implementing MultiTenancy Feature.      
+AS        
+ SET NOCOUNT ON        
+        
+ DECLARE @maxid int        
+ DECLARE @id int        
+ DECLARE @reviewItemTypeID int        
+ DECLARE @reviewItemName varchar(64)        
+ DECLARE @taskType table (ID int identity (1,1), reviewItemTypeID int)        
+       
+ DECLARE @DISErrorNumber int      
+ DECLARE @ErrorMessage VARCHAR(1024)      
+ DECLARE @SPName sysname      
+       
+  SET @SPName = 'OSJ_CreateTasks'      
+      
+  --Create the temp table if they do not exist. Aids in debugging runs.      
+ IF NOT EXISTS (select * from tempdb.dbo.sysobjects where id = object_id(N'tempdb.dbo.#StoredProcProgressMessages'))      
+  CREATE TABLE #StoredProcProgressMessages      
+  (      
+   MessageTime DATETIME,      
+   ProcedureName varchar(256),      
+   Message varchar(2048),      
+   ErrorCode int      
+  )      
+      
+ IF NOT EXISTS (select * from tempdb.dbo.sysobjects where id = object_id(N'tempdb.dbo.#StoredProcErrorMessages'))      
+  CREATE TABLE #StoredProcErrorMessages      
+  (      
+   ErrorNumber int,      
+   ErrorMessage varchar(2048)      
+  )      
+      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'Start Procedure', -1 )      
+      
+ SET @DISErrorNumber = -1      
+        
+ INSERT INTO @taskType        
+ SELECT ReviewItemTypeID        
+ FROM        
+  OSJSupervision.dbo.FrequencyInterval fi (nolock)        
+  INNER JOIN OSJSupervision.dbo.ReviewItemType rit (nolock)        
+   ON fi.FrequencyIntervalID=rit.FrequencyIntervalID        
+ WHERE        
+  fi.FrequencyIntervalID=@FrequencyIntervalID       
+  AND rit.TenantID=@TenantID  --Filter data specific to TenantID(1= LPL and 3= AXA)        
+  --the following could be done as "rit.displayGroup <> 3"        
+  AND ReviewItemName NOT IN ('Outside Business Activity Approval','Trade Blotter Review','Email Review','Account Level Review','Direct Business - Trade Review','Direct Business-Source Of Funds','Complex ETP/MF Holdings')        
+ ORDER BY ReviewItemTypeID        
+       
+ SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Failed to insert into @taskType'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'Inserted into @taskType', -1 )      
+         
+ SELECT @maxid=count(*) FROM @taskType        
+ SET @id=1        
+ WHILE @id <= @maxid BEGIN        
+  SELECT @reviewItemTypeID=reviewItemTypeID        
+  FROM @taskType        
+  WHERE id=@id        
+          
+  SELECT @reviewItemName=ReviewItemName        
+  FROM OSJSupervision.dbo.ReviewItemType        
+  WHERE ReviewItemTypeID=@reviewItemTypeID AND TenantID =@TenantID   --Added a Parameter @TenantID for implementing MultiTenancy Feature.       
+          
+  IF @reviewItemName IN ('Actively Traded Accounts','Concentrated Positions','Low Priced Securities')        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_CreateMantasReviewItem @reviewItemTypeID ,@TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature       
+         
+   SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateMantasReviewItem'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_CreateMantasReviewItem completed successfully', -1 )      
+END      
+         
+  ELSE IF @reviewItemName IN ( 'Third Party Disbursements', 'Third Party Disbursements (Old)' )        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_Create3rdPartyReviewItem  @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature      
+         
+   SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_Create3rdPartyReviewItem'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_Create3rdPartyReviewItem completed successfully', -1 )      
+       
+ END      
+       
+  ELSE IF @reviewItemName='Outside Business Activity Review'        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_CreateOBAReviews  @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+    SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateOBAReviews'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_CreateOBAReviews completed successfully', -1 )      
+ END      
+         
+  ELSE IF @reviewItemName='Change Of Addresses'        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_CreateChangeOfAddressReviewItem  @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+    SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateChangeOfAddressReviewItem'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_CreateChangeOfAddressReviewItem completed successfully', -1 )      
+ END      
+         
+  ELSE IF @reviewItemName='Possible Front-Running'        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_CreateReviewAccountReviewItem @reviewItemTypeID , @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+       SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateReviewAccountReviewItem'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_CreateReviewAccountReviewItem completed successfully', -1 )      
+ END      
+       
+  ELSE IF @reviewItemName='Mutual Fund - Switches'        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_LoadMutualFundAlertDetails @reviewItemTypeID , @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+       SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_LoadMutualFundAlertDetails'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_LoadMutualFundAlertDetails completed successfully', -1 )      
+ END      
+  --DOL609--  
+ ELSE IF @reviewItemName IN ('Mutual Fund Only','Mutual Fund Fee Lookback')        
+ BEGIN      
+      
+ PRINT @reviewItemTypeID  
+   
+ EXEC OSJSupervision.dbo.OSJ_CreateMFOReviewItem @reviewItemTypeID ,@TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature         
+   
+ SELECT @DISErrorNumber = @@ERROR      
+    
+ IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateMFOReviewItem'      
+  GOTO SP_EXIT      
+ END   
+  
+  INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+  VALUES(Getdate(), @SPName, 'OSJ_CreateMFOReviewItem completed successfully', -1 )  
+    
+    
+  
+ END     
+   
+ --ELSE IF @reviewItemName IN ('Prudent Process Trade Data')        
+ --BEGIN      
+      
+ --PRINT @reviewItemTypeID  
+   
+ --EXEC OSJSupervision.dbo.OSJ_CreatePPReviewItem @reviewItemTypeID ,@TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature         
+   
+ --SELECT @DISErrorNumber = @@ERROR      
+    
+ --IF @DISErrorNumber <> 0      
+ --BEGIN      
+ --	SET @ErrorMessage = 'Execution Failed - OSJ_CreatePPReviewItem'     
+ --	GOTO SP_EXIT      
+ --END   
+  
+ -- INSERT INTO #StoredProcProgressMessages      
+ --( MessageTime, ProcedureName, Message, ErrorCode )      
+ -- VALUES(Getdate(), @SPName, 'OSJ_CreatePPReviewItem completed successfully', -1 )  
+    
+ -- PRINT    'Prudent Process Trade Data'    
+  
+ --END     
+  
+ --DOL609--         
+  ELSE        
+  BEGIN      
+   EXEC OSJSupervision.dbo.OSJ_CreateReviewItem @reviewItemTypeID , @TenantID  -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+    SELECT @DISErrorNumber = @@ERROR      
+        IF @DISErrorNumber <> 0      
+ BEGIN      
+  SET @ErrorMessage = 'Execution Failed - OSJ_CreateReviewItem'      
+  GOTO SP_EXIT      
+ END      
+      
+ INSERT INTO #StoredProcProgressMessages      
+ ( MessageTime, ProcedureName, Message, ErrorCode )      
+ VALUES      
+ (Getdate(), @SPName, 'OSJ_CreateReviewItem completed successfully', -1 )      
+ END      
+         
+  SET @id=@id + 1        
+        
+  DELETE FROM #StoredProcErrorMessages      
+        
+SP_EXIT:        
+      
+IF @ErrorMessage IS NOT NULL      
+ BEGIN      
+  --DELETE FROM #StoredProcErrorMessages      
+        
+   INSERT INTO #StoredProcErrorMessages      
+     (ErrorNumber, ErrorMessage)         
+	 VALUES      
+     ( @DISErrorNumber, @ErrorMessage )      
+          
+   PRINT @ErrorMessage      
+  END    
+ END      
+     
+  
+  
+ --/* Pulling the tasks from ReviewItem into IncompleteTasklIst to show on the ORT Screen */    
+ --set @SPName = 'Incomplete_Master'    
+ --INSERT INTO #StoredProcProgressMessages      
+ --( MessageTime, ProcedureName, Message, ErrorCode )      
+ --VALUES      
+ --(Getdate(), @SPName, 'Incomplete_Master Started successfully', -1 )      
+ --EXEC OSJSupervision.dbo.Incomplete_Master  @TenantID -- adding extra parameter @TenantID for implementing MultiTenancy feature        
+         
+ --   SELECT @DISErrorNumber = @@ERROR      
+ --       IF @DISErrorNumber <> 0      
+ --BEGIN      
+ --SET @ErrorMessage = 'Execution Failed - Incomplete_Master'      
+ --INSERT INTO #StoredProcErrorMessages      
+ --    (ErrorNumber, ErrorMessage)      
+ --  VALUES      
+ --    ( @DISErrorNumber, @ErrorMessage )      
+          
+ --  PRINT @ErrorMessage      
+    
+      
+--END
+GO
+
+
